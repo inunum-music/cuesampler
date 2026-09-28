@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light">
+<title>キュー出し</title>
+<style>
+:root{--bg:#f4f8fc;--panel:#fff;--ink:#0f2038;--sub:#6b7c93;--line:#d6e2f0;--se:#0ea5e9;--bgm:#2563eb;--stop:#1e40af;
+box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:"Hiragino Sans","Yu Gothic",system-ui,sans-serif;padding:16px}
+header{display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between;margin-bottom:16px}
+h1{font-size:18px;margin:0;letter-spacing:.08em;color:var(--bgm)}
+.master{display:flex;flex-wrap:wrap;gap:12px;align-items:center;font-size:13px;color:var(--sub)}
+.master input{width:130px;accent-color:var(--bgm)}
+#panic{background:var(--stop);color:#fff;border:0;border-radius:10px;padding:12px 20px;font-size:16px;font-weight:700;cursor:pointer}
+#clr{border:1px solid var(--line);background:#fff;color:var(--sub);border-radius:8px;padding:6px 10px;font-size:12px;cursor:pointer}
+#st{font-size:12px}
+.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
+.cue{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:12px;display:flex;flex-direction:column;gap:8px;box-shadow:0 1px 3px rgba(30,64,175,.06)}
+.cue.drag{outline:2px dashed var(--bgm)}
+.top{display:flex;justify-content:space-between;align-items:center;font-size:12px;color:var(--sub)}
+.name{background:none;border:0;border-bottom:1px solid transparent;color:var(--ink);font-size:16px;font-weight:600;width:100%;padding:2px 0;font-family:inherit}
+.name:focus{outline:0;border-bottom-color:var(--c)}
+.go{position:relative;overflow:hidden;height:120px;border-radius:12px;border:2px solid var(--c);background:#fff;color:var(--c);font-size:40px;font-weight:800;cursor:pointer;font-family:inherit}
+.go:disabled{opacity:.35;cursor:not-allowed}
+.go .bar{position:absolute;left:0;bottom:0;height:6px;width:0;background:var(--c)}
+.cue.playing .go{background:var(--c);color:#fff}
+.cue.playing .go .bar{background:#fff}
+.se{--c:var(--se)}.bgm{--c:var(--bgm)}
+.row{display:flex;gap:6px;align-items:center;font-size:12px}
+.row button,.row label.f{border:1px solid var(--c);background:#fff;color:var(--c);border-radius:8px;padding:6px 8px;cursor:pointer;font-size:12px;font-family:inherit}
+.row input[type=range]{flex:1;min-width:0;accent-color:var(--c)}
+.file{color:var(--sub);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.hint{margin-top:14px;font-size:12px;color:var(--sub)}
+@media (max-width:700px){.grid{gap:8px}.cue{padding:8px}.go{height:80px;font-size:30px}.name{font-size:14px}.row{flex-wrap:wrap}.file{display:none}}
+</style>
+</head>
+<body>
+<header>
+  <h1>CUE SAMPLER</h1>
+  <div class="master"><span id="st"></span><button id="clr">保存を消去</button><span>マスター音量</span><input id="mv" type="range" min="0" max="1" step="0.01" value="1"><button id="panic">全停止 (Space)</button></div>
+</header>
+<div class="grid" id="grid"></div>
+<p class="hint">キー 1〜9 で発音／もう一度押すと停止（SEは即停止、BGMは1.5秒でフェードアウト）。音源は各ボタンの「音源」から読込、またはドラッグ＆ドロップ。音源・キュー名・SE/BGM・音量はこのブラウザに自動保存されます。</p>
+<script>
+const N=9, FADE=1.5;
+let ctx, master;
+const cues=[];
+function init(){ if(ctx) return; ctx=new (window.AudioContext||window.webkitAudioContext)(); master=ctx.createGain(); master.connect(ctx.destination); master.gain.value=+mv.value; }
+mv.oninput=()=>{ if(master) master.gain.value=+mv.value; };
+
+/* ---- 保存 (IndexedDB) ---- */
+let db=null;
+const setSt=t=>st.textContent=t;
+function openDB(){ return new Promise(res=>{ try{
+  const r=indexedDB.open('cue-sampler',1);
+  r.onupgradeneeded=()=>r.result.createObjectStore('cues',{keyPath:'i'});
+  r.onsuccess=()=>res(r.result); r.onerror=()=>res(null);
+}catch(e){res(null);} }); }
+function persist(c){
+  if(!db) return;
+  try{
+    const rec={i:c.i,name:c.el.querySelector('.name').value,loop:c.loop,vol:c.vol,fname:c.fname||'',raw:c.raw||null};
+    const tx=db.transaction('cues','readwrite'); tx.objectStore('cues').put(rec);
+    tx.oncomplete=()=>setSt('保存済み'); tx.onerror=()=>setSt('保存に失敗');
+  }catch(e){ setSt('保存に失敗'); }
+}
+
+for(let i=0;i<N;i++){
+  const c={i,buf:null,raw:null,fname:'',src:null,gain:null,start:0,loop:i>=7,vol:1,el:null};
+  const d=document.createElement('div');
+  d.innerHTML=`<div class="top"><span>CUE ${i+1}</span><span class="type"></span></div>
+  <input class="name" value="キュー${i+1}">
+  <button class="go" disabled>${i+1}<span class="bar"></span></button>
+  <div class="row"><label class="f">音源<input type="file" accept="audio/*" hidden></label><button class="tg"></button><span class="file">未読込</span></div>
+  <div class="row"><span>音量</span><input class="vol" type="range" min="0" max="1" step="0.01" value="1"></div>`;
+  c.el=d; cues.push(c); grid.appendChild(d);
+  const q=s=>d.querySelector(s);
+  c.refresh=()=>{ d.className='cue '+(c.loop?'bgm':'se')+(c.src?' playing':''); q('.type').textContent=c.loop?'BGM（ループ）':'SE（1回）'; q('.tg').textContent=c.loop?'→SEにする':'→BGMにする'; };
+  c.refresh();
+  q('.tg').onclick=()=>{ stop(c,0); c.loop=!c.loop; c.refresh(); persist(c); };
+  q('.vol').oninput=e=>{ c.vol=+e.target.value; if(c.gain) c.gain.gain.value=c.vol; };
+  q('.vol').onchange=()=>persist(c);
+  q('.name').onchange=()=>persist(c);
+  q('input[type=file]').onchange=e=>load(c,e.target.files[0]);
+  q('.go').onclick=()=>trigger(c);
+  d.ondragover=e=>{e.preventDefault();d.classList.add('drag')};
+  d.ondragleave=()=>d.classList.remove('drag');
+  d.ondrop=e=>{e.preventDefault();d.classList.remove('drag');load(c,e.dataTransfer.files[0])};
+}
+
+async function decode(c,raw,fname){
+  const q=s=>c.el.querySelector(s);
+  try{
+    c.buf=await ctx.decodeAudioData(raw.slice(0));
+    c.raw=raw; c.fname=fname;
+    q('.file').textContent=fname+' ('+c.buf.duration.toFixed(1)+'s)';
+    q('.go').disabled=false; return true;
+  }catch(err){ q('.file').textContent='読込失敗'; return false; }
+}
+async function load(c,f){
+  if(!f) return; init(); stop(c,0);
+  if(await decode(c,await f.arrayBuffer(),f.name)){
+    const n=c.el.querySelector('.name'); if(n.value===`キュー${c.i+1}`) n.value=f.name.replace(/\.[^.]+$/,'');
+    persist(c);
+  }
+}
+
+function trigger(c){
+  init(); if(ctx.state==='suspended') ctx.resume();
+  if(!c.buf) return;
+  if(c.src){ stop(c,c.loop?FADE:0.05); return; }
+  const s=ctx.createBufferSource(), g=ctx.createGain();
+  s.buffer=c.buf; s.loop=c.loop; g.gain.value=c.vol;
+  s.connect(g).connect(master); s.start();
+  c.src=s; c.gain=g; c.start=ctx.currentTime;
+  s.onended=()=>{ if(c.src===s){ c.src=null; c.gain=null; ui(c,false);} };
+  ui(c,true);
+}
+
+function stop(c,fade){
+  if(!c.src) return;
+  const s=c.src, g=c.gain;
+  c.src=null; c.gain=null; ui(c,false);
+  if(fade>0){ const t=ctx.currentTime; g.gain.cancelScheduledValues(t); g.gain.setValueAtTime(g.gain.value,t); g.gain.linearRampToValueAtTime(0,t+fade); s.stop(t+fade+0.02); }
+  else { try{s.stop();}catch(e){} }
+}
+function ui(c,on){ c.el.classList.toggle('playing',on); if(!on) c.el.querySelector('.bar').style.width='0'; }
+
+function tick(){
+  if(ctx) for(const c of cues) if(c.src){
+    const d=c.buf.duration, t=(ctx.currentTime-c.start)%d;
+    c.el.querySelector('.bar').style.width=(t/d*100)+'%';
+  }
+  requestAnimationFrame(tick);
+}
+tick();
+
+panic.onclick=()=>cues.forEach(c=>stop(c,FADE));
+clr.onclick=()=>{
+  if(!confirm('保存した音源と設定をすべて消去します。よろしいですか？')) return;
+  cues.forEach(c=>stop(c,0));
+  try{ db.transaction('cues','readwrite').objectStore('cues').clear().onsuccess=()=>location.reload(); }catch(e){ location.reload(); }
+};
+addEventListener('keydown',e=>{
+  if(e.target.tagName==='INPUT'&&e.target.type!=='range') return;
+  if(e.code==='Space'){e.preventDefault();panic.click();return;}
+  const n=parseInt(e.key,10);
+  if(n>=1&&n<=N&&!e.repeat) trigger(cues[n-1]);
+});
+
+/* ---- 起動時に復元 ---- */
+(async()=>{
+  db=await openDB();
+  if(!db){ setSt('保存できない環境です'); return; }
+  init();
+  const all=await new Promise(res=>{ try{ const r=db.transaction('cues').objectStore('cues').getAll(); r.onsuccess=()=>res(r.result); r.onerror=()=>res([]); }catch(e){res([]);} });
+  for(const rec of all){
+    const c=cues[rec.i]; if(!c) continue;
+    c.loop=rec.loop; c.vol=rec.vol;
+    c.el.querySelector('.name').value=rec.name;
+    c.el.querySelector('.vol').value=rec.vol;
+    c.refresh();
+    if(rec.raw) await decode(c,rec.raw,rec.fname);
+  }
+  setSt(all.length?'保存データを復元しました':'');
+})();
+</script>
+</body>
+</html>
